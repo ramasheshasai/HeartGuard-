@@ -1,0 +1,282 @@
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split, KFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression, RidgeClassifier
+from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier, GradientBoostingClassifier
+from sklearn.metrics import accuracy_score, classification_report
+from sklearn.utils import shuffle
+from sklearn.metrics import roc_auc_score, roc_curve
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+import os
+
+# ==============================
+# 1️⃣ Load & merge all 4 datasets (with safety check)
+# ==============================
+files = [
+    r"C:\Users\InduS\OneDrive\Desktop\UROP Project\Project-Test-1\HeartDisease\Dataset\processed.cleveland.data",
+    r"C:\Users\InduS\OneDrive\Desktop\UROP Project\Project-Test-1\HeartDisease\Dataset\processed.hungarian.data",
+    r"C:\Users\InduS\OneDrive\Desktop\UROP Project\Project-Test-1\HeartDisease\Dataset\processed.switzerland.data",
+    r"C:\Users\InduS\OneDrive\Desktop\UROP Project\Project-Test-1\HeartDisease\Dataset\processed.va.data"
+]
+
+# Preprocessing the datasets with safety checks
+df_list = []
+for file in files:
+    temp = pd.read_csv(file, header=None)
+    temp.replace('?', pd.NA, inplace=True)
+    temp = temp.dropna().apply(pd.to_numeric, errors='coerce')
+    temp = temp.dropna(how='all')  # ✅ remove fully empty rows
+    if not temp.empty:
+        df_list.append(temp)
+
+# ✅ Concatenate only non-empty datasets
+df = pd.concat(df_list, ignore_index=True)
+
+# ==============================
+# 2️⃣ Preprocess data
+# ==============================
+X = df.iloc[:, :-1].values  # Features
+y = (df.iloc[:, -1] > 0).astype(int).values  # Binary target (0/1)
+
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X_scaled, y, test_size=0.2, random_state=42
+)
+
+# ==============================
+# 3️⃣ Define base models (tuned)
+# ==============================
+base_models = [
+    ('rf', RandomForestClassifier(
+        n_estimators=500, max_depth=10, min_samples_split=4,
+        min_samples_leaf=2, random_state=42
+    )),
+    ('et', ExtraTreesClassifier(
+        n_estimators=500, max_depth=10, min_samples_split=4,
+        min_samples_leaf=2, random_state=42
+    )),
+    ('gb', GradientBoostingClassifier(
+        n_estimators=400, learning_rate=0.05, max_depth=5,
+        subsample=0.9, random_state=42
+    )),
+    ('lr', LogisticRegression(
+        solver='liblinear', C=1.5, max_iter=1500, random_state=42
+    ))
+]
+
+# ==============================
+# 4️⃣ Stacking using K-Fold
+# ==============================
+kf = KFold(n_splits=10, shuffle=True, random_state=42)
+train_meta = np.zeros((X_train.shape[0], len(base_models)))
+test_meta = np.zeros((X_test.shape[0], len(base_models)))
+
+for i, (name, model) in enumerate(base_models):
+    test_fold_preds = np.zeros((X_test.shape[0], kf.n_splits))
+    for fold, (tr_idx, val_idx) in enumerate(kf.split(X_train)):
+        X_tr, X_val = X_train[tr_idx], X_train[val_idx]
+        y_tr, y_val = y_train[tr_idx], y_train[val_idx]
+
+        model.fit(X_tr, y_tr)
+        train_meta[val_idx, i] = model.predict(X_val)
+        test_fold_preds[:, fold] = model.predict(X_test)
+
+    test_meta[:, i] = test_fold_preds.mean(axis=1)
+
+# ==============================
+# 5️⃣ Meta-model (Ridge Classifier)
+# ==============================
+meta_model = RidgeClassifier(alpha=0.5)
+meta_model.fit(train_meta, y_train)
+stack_pred = meta_model.predict(test_meta)
+
+# ✅ Extract Ridge model weights
+weights = meta_model.coef_.flatten()
+print("\nRidge Classifier Weights for Base Models:")
+for name, weight in zip([n for n, _ in base_models], weights):
+    print(f"{name}: {weight:.4f}")
+
+# ✅ Save Ridge weights to text file
+folder_path = r"C:\Users\InduS\OneDrive\Desktop\UROP Project\Project-Test-1\HeartDisease\results\centralised"
+os.makedirs(folder_path, exist_ok=True)
+weights_path = os.path.join(folder_path, "ridge_model_weights.txt")
+with open(weights_path, "w", encoding="utf-8") as f:
+    f.write("Base Model Weights (Ridge Classifier)\n")
+    f.write("====================================\n")
+    for name, weight in zip([n for n, _ in base_models], weights):
+        f.write(f"{name}: {weight:.4f}\n")
+print(f"\nRidge classifier weights saved at: {weights_path}")
+
+# ==============================
+# 6️⃣ Evaluate results
+# ==============================
+acc = accuracy_score(y_test, stack_pred)
+report = classification_report(y_test, stack_pred)
+
+# Compute confusion matrix
+cm = confusion_matrix(y_test, stack_pred)
+print("\nConfusion Matrix:\n", cm)
+
+# Plot and save confusion matrix
+plt.figure(figsize=(5, 4))
+disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=["No Disease (0)", "Disease (1)"])
+disp.plot(cmap='Blues', values_format='d')
+plt.title("Confusion Matrix - Centralized Stacking Ensemble")
+plt.savefig(os.path.join(folder_path, "confusion_matrix.png"), bbox_inches="tight", dpi=300)
+plt.close()
+
+
+# Compute AUC
+y_prob = meta_model.decision_function(test_meta)  # RidgeClassifier gives decision scores
+auc = roc_auc_score(y_test, y_prob)
+print(f"\nAUC Score: {auc:.4f}")
+
+# Plot ROC Curve
+fpr, tpr, thresholds = roc_curve(y_test, y_prob)
+plt.figure(figsize=(5, 4))
+plt.plot(fpr, tpr, label=f'ROC Curve (AUC = {auc:.4f})')
+plt.plot([0, 1], [0, 1], 'k--')
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.title("ROC Curve - Centralized Stacking Ensemble")
+plt.legend(loc="lower right")
+plt.savefig(os.path.join(folder_path, "roc_curve.png"), bbox_inches="tight", dpi=300)
+plt.close()
+print(f"ROC curve saved at: {os.path.join(folder_path, 'roc_curve.png')}")
+print(f"Confusion matrix saved at: {os.path.join(folder_path, 'confusion_matrix.png')}")
+print("\nPower Boost Ensemble Accuracy:", acc)
+print("\nClassification Report:\n", report)
+
+
+# ==============================
+# LOSS FUNCTION DEFINITIONS
+# ==============================
+
+def ridge_loss(y_true, y_pred, weights, alpha=0.5):
+    """Ridge Regression Loss = MSE + L2 regularization"""
+    mse = np.mean((y_true - y_pred) ** 2)
+    l2 = alpha * np.sum(weights ** 2)
+    return mse + l2
+
+def binary_cross_entropy(y_true, y_prob):
+    """Binary Cross Entropy Loss"""
+    y_prob = np.clip(y_prob, 1e-9, 1 - 1e-9)
+    bce = -np.mean(y_true * np.log(y_prob) + (1 - y_true) * np.log(1 - y_prob))
+    return bce
+
+def hinge_loss(y_true, y_pred):
+    """Hinge Loss (for margin-based classifiers like SVM)"""
+    y_true = np.where(y_true == 0, -1, 1)
+    return np.mean(np.maximum(0, 1 - y_true * y_pred))
+
+# ==============================
+# COMPUTE PREDICTIONS & LOSSES
+# ==============================
+
+# Ridge classifier predictions
+y_pred_class = stack_pred  # Predicted class (0/1)
+y_pred_prob = np.clip(meta_model.decision_function(test_meta), -10, 10)  # raw decision scores
+
+# Convert to probability (for BCE)
+prob = 1 / (1 + np.exp(-y_pred_prob))  
+
+ridge_w = meta_model.coef_.flatten()
+
+ridge_l = ridge_loss(y_test, y_pred_class, ridge_w, alpha=0.5)
+bce_l = binary_cross_entropy(y_test, prob)
+hinge_l = hinge_loss(y_test, y_pred_prob)
+
+# ==============================
+# PRINT LOSS VALUES
+# ==============================
+print("\n--- LOSS FUNCTION VALUES ---")
+print(f"Ridge Loss: {ridge_l:.4f}")
+print(f"Binary Cross-Entropy Loss: {bce_l:.4f}")
+print(f"Hinge Loss: {hinge_l:.4f}")
+
+# ==============================
+# SAVE TO FILE
+# ==============================
+loss_path = os.path.join(folder_path, "loss_values.txt")
+with open(loss_path, "w", encoding="utf-8") as f:
+    f.write("Loss Function Results\n")
+    f.write("=====================\n")
+    f.write(f"Ridge Loss: {ridge_l:.4f}\n")
+    f.write(f"Binary Cross-Entropy Loss: {bce_l:.4f}\n")
+    f.write(f"Hinge Loss: {hinge_l:.4f}\n")
+
+print(f"\nLoss values saved successfully at: {loss_path}")
+
+
+
+# ==============================
+# 7️⃣ Save results
+# ==============================
+output_path = os.path.join(folder_path, "power_ensemble_report.txt")
+with open(output_path, "w", encoding="utf-8") as f:
+    f.write(f"Power Boost Ensemble Accuracy: {acc}\n\n")
+    f.write(report)
+print(f"\nResults saved successfully at: {output_path}")
+
+# ==============================
+# 8️⃣ SHAP Feature Importance Analysis (on Gradient Boosting)
+# ==============================
+import shap
+import matplotlib.pyplot as plt
+
+print("\nStarting SHAP feature importance analysis...")
+
+# Select and fit Gradient Boosting model
+gb_model = [m for n, m in base_models if n == 'gb'][0]
+gb_model.fit(X_train, y_train)
+
+# Create SHAP explainer and compute values (disable additivity check)
+explainer = shap.Explainer(gb_model, X_train)
+shap_values = explainer(X_test, check_additivity=False)
+
+# Define feature names (UCI Heart Disease dataset)
+feature_names = [
+    "age", "sex", "cp", "trestbps", "chol", "fbs",
+    "restecg", "thalach", "exang", "oldpeak",
+    "slope", "ca", "thal"
+]
+
+# ==============================
+# Save SHAP Summary Plot (Dot Plot)
+# ==============================
+plt.figure()
+shap.summary_plot(shap_values, features=X_test, feature_names=feature_names, show=False)
+summary_path = os.path.join(folder_path, "shap_summary_plot.png")
+plt.savefig(summary_path, bbox_inches="tight", dpi=300)
+plt.close()
+print(f" SHAP summary plot saved at: {summary_path}")
+
+# ==============================
+# Save SHAP Bar Plot (Global Importance)
+# ==============================
+plt.figure()
+shap.summary_plot(shap_values, features=X_test, feature_names=feature_names, plot_type="bar", show=False)
+bar_path = os.path.join(folder_path, "shap_bar_plot.png")
+plt.savefig(bar_path, bbox_inches="tight", dpi=300)
+plt.close()
+print(f" SHAP bar plot saved at: {bar_path}")
+
+# ==============================
+# Save Top 10 Features as Text
+# ==============================
+shap_mean = np.abs(shap_values.values).mean(axis=0)
+feature_importance = sorted(zip(feature_names, shap_mean), key=lambda x: x[1], reverse=True)
+
+txt_path = os.path.join(folder_path, "shap_feature_importance.txt")
+with open(txt_path, "w", encoding="utf-8") as f:
+    f.write("Top 10 Most Important Features (Based on SHAP values)\n")
+    f.write("============================================\n")
+    for i, (feat, val) in enumerate(feature_importance[:10], start=1):
+        f.write(f"{i}. {feat} — {val:.4f}\n")
+
+print(f" SHAP feature importance text file saved at: {txt_path}")
+print("\nSHAP feature analysis completed successfully!")
